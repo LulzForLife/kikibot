@@ -8,20 +8,25 @@ import nnue
 from time import perf_counter
 from dataclasses import dataclass
 
-from typing import cast
+from typing import cast, Literal
+from collections.abc import Generator
+
+InputModeOption = Literal["UCI", "SAN"]
 
 SELF_PLAY = False
 BOT_STARTS = False
 USE_OPENING = False
 USE_SYZYGY = True
+INPUT_MODE: InputModeOption = "UCI"
 
 TIME_LIMIT = 10.0
 MAX_DEPTH = 10
 
-INF = 100000
-INF_THRESHHOLD = 97500
-TABLEBASE_INF = 95000
-TABLEBASE_INF_THRESHHOLD = 90000
+INF = 100000.0
+INF_THRESHHOLD = 97500.0
+TABLEBASE_INF = 95000.0
+TABLEBASE_INF_THRESHHOLD = 90000.0
+MAX_PLY = 64
 
 EXACT = 0
 UPPER = 1
@@ -29,6 +34,11 @@ LOWER = 2
 
 nodes = 0
 tt: dict[str, TTEntry] = {}
+
+killer0: list[chess.Move | None] = [None for _ in range(MAX_PLY)]
+killer1: list[chess.Move | None] = [None for _ in range(MAX_PLY)]
+history_white: dict[chess.Move, int] = {}
+history_black: dict[chess.Move, int] = {}
 
 tablebase = syzygy.Tablebase()
 try:
@@ -38,6 +48,15 @@ except FileNotFoundError:
     USE_SYZYGY = False
 
 opening_book = polyglot.open_reader("komodo.bin")
+
+MMVLVA = {
+    chess.KING: INF,
+    chess.QUEEN: 900,
+    chess.ROOK: 500,
+    chess.BISHOP: 330,
+    chess.KNIGHT: 300,
+    chess.PAWN: 100
+}
 
 @dataclass(slots=True)
 class TTEntry:
@@ -51,11 +70,17 @@ def get_user_move(b: chess.Board) -> chess.Move:
     legal_moves = b.legal_moves()
     while True:
         try:
-            move = chess.Move.from_uci(input("Enter move (e.g. e2e4): "))
-            assert move is not None
-            assert move in legal_moves
+            move = None
+            if INPUT_MODE == "SAN":
+                move = chess.Move.from_san(input("Enter move (e.g. e4): "), b)
+            else:
+                move = chess.Move.from_uci(input("Enter move (e.g. e2e4): "))
+            if move is None:
+                raise ValueError
+            if move not in legal_moves:
+                raise ValueError
             break
-        except (ValueError, AssertionError):
+        except ValueError:
             ...
     return move
 
@@ -63,8 +88,8 @@ def get_best_tablebase_move(b: chess.Board) -> tuple[chess.Move, float]:
 
     c_board = c.Board(b.fen())
 
-    best_wdl = -INF
-    best_dtz = INF
+    best_wdl = int(-INF)
+    best_dtz = int(INF)
     best_move = None
 
     for move in c_board.legal_moves:
@@ -84,14 +109,16 @@ def get_best_tablebase_move(b: chess.Board) -> tuple[chess.Move, float]:
             best_dtz = dtz
             best_move = move
 
-    best_move = cast(chess.Move, chess.Move.from_uci(cast(c.Move, best_move).uci()))
+    assert best_move is not None
+    best_chess_move = chess.Move.from_uci(best_move.uci())
+    assert best_chess_move is not None
 
     if best_wdl == 2:
-        return best_move, 1
+        return best_chess_move, TABLEBASE_INF
     elif best_wdl == -2:
-        return best_move, 0
+        return best_chess_move, -TABLEBASE_INF
     else:
-        return best_move, 0.5
+        return best_chess_move, 0
 
 def get_best_opening_move(board: chess.Board) -> chess.Move | None:
     try:
@@ -122,6 +149,113 @@ def clean_tt(b: chess.Board) -> None:
             expired.add(b_fen)
     for b_fen in expired:
         del tt[b_fen]
+
+def store_killer(move: chess.Move, ply: int) -> None:
+    global killer0, killer1
+
+    if killer0[ply] != move:
+        killer1[ply] = killer0[ply]
+        killer0[ply] = move
+
+def clear_killer() -> None:
+    global killer0, killer1
+
+    killer0 = [None for _ in range(MAX_PLY)]
+    killer1 = [None for _ in range(MAX_PLY)]
+
+def store_history(move: chess.Move, depth: int, turn: chess.Color) -> None:
+    global history_white, history_black
+
+    if turn is chess.WHITE:
+        history_white[move] = history_white.get(move, 0) + (depth * depth)
+
+def decay_history() -> None:
+    global history_white, history_black
+
+    history_white = {move: (score >> 1) for move, score in history_white.items()}
+    history_black = {move: (score >> 1) for move, score in history_black.items()}
+
+def order_moves(b: chess.Board, b_fen: str, ply: int, captures_only: bool = False) -> Generator[chess.Move]:
+    entry = tt.get(b_fen)
+    if entry is not None:
+        tt_move = entry.move
+    else:
+        tt_move = None
+
+    if tt_move is not None:
+        yield tt_move
+
+    if b.turn is chess.WHITE:
+        history = history_white
+    else:
+        history = history_black
+
+    k0 = killer0[ply]
+    k1 = killer1[ply]
+    k0_exists = False
+    k1_exists = False
+
+    winning: dict[chess.Move, float] = {}
+    equal: list[chess.Move] = []
+    losing: dict[chess.Move, float] = {}
+    quiets: dict[chess.Move, float] = {}
+
+    for move in b.legal_moves():
+        if move == tt_move:
+            continue
+
+        if move == k0:
+            k0_exists = True
+
+        if move == k1:
+            k1_exists = True
+
+        if move.is_promotion():
+            promo = move.promotion
+            assert promo
+            if (not captures_only) or promo is chess.QUEEN:
+                winning[move] = MMVLVA[promo]
+                continue
+        elif move.is_capture(b):
+            victim = b[move.destination]
+            victim_type = chess.PAWN if victim is None else victim.piece_type
+            attacker = b[move.origin]
+            assert attacker is not None
+            attacker_type = attacker.piece_type
+            victim_value = MMVLVA[victim_type]
+            attacker_value = MMVLVA[attacker_type]
+            diff = victim_value - attacker_value
+            score = victim_value * 10 - attacker_value
+
+            if diff > 0:
+                winning[move] = score
+            elif diff == 0:
+                equal.append(move)
+            else:
+                losing[move] = score
+            continue
+        elif not captures_only:
+            quiets[move] = history.get(move, 0)
+
+    for move, score in sorted(winning.items(), key=lambda t: t[1]):
+        yield move
+
+    if not captures_only:
+        if k0_exists and k0 is not None:
+            yield k0
+
+        if k1_exists and k1 is not None:
+            yield k1
+
+    for move in equal:
+        yield move
+
+    if not captures_only:
+        for move, score in sorted(quiets.items(), key=lambda t: t[1]):
+            yield move
+
+    for move, score in sorted(losing.items(), key=lambda t: t[1]):
+        yield move
 
 def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, end: float) -> float:
     global nodes
@@ -156,17 +290,17 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             c_board = c.Board(b_fen)
             wdl = tablebase.probe_wdl(c_board)
             if -1 <= wdl <= 1:
-                return wdl
-            dtz = tablebase.probe_dtz(c_board)
-            if dtz + b.halfmove_clock >= 100:
-                score = wdl
-                return wdl
-            elif wdl > 0:
-                score = TABLEBASE_INF - dtz
+                score = float(wdl)
             else:
-                score = -TABLEBASE_INF - dtz
+                dtz = tablebase.probe_dtz(c_board)
+                if dtz + b.halfmove_clock >= 100:
+                    score = float(wdl)
+                elif wdl > 0:
+                    score = TABLEBASE_INF - dtz
+                else:
+                    score = -TABLEBASE_INF - dtz
 
-            store_tt(b, b_fen, score, INF, EXACT, None)
+            store_tt(b, b_fen, score, int(INF), EXACT, None)
 
             return score
 
@@ -182,7 +316,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
     best_score = -INF
     best_move = None
-    for n, move in enumerate(b.legal_moves()):
+    for n, move in enumerate(order_moves(b, b_fen, ply)):
         b.apply(move)
         if n == 0:
             score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, end)
@@ -200,6 +334,9 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             alpha = score
 
         if alpha >= beta:
+            if not (move.is_capture(b) or move.is_promotion()):
+                store_killer(move, ply)
+                store_history(move, depth, b.turn)
             break
 
     if best_score <= original_alpha:
@@ -215,7 +352,11 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
     elif tt_score < -INF_THRESHHOLD:
         tt_score = -INF_THRESHHOLD - ply
 
-    store_tt(b, b_fen, tt_score, depth, flag, best_move)
+    if entry is not None:
+        if flag == EXACT or entry.depth < depth:
+            store_tt(b, b_fen, tt_score, depth, flag, best_move)
+    else:
+        store_tt(b, b_fen, tt_score, depth, flag, best_move)
 
     return best_score
 
@@ -236,10 +377,11 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
 
     best_move = None
     best_alpha = -INF
-    cur_best_move = None
-    alpha = -INF
 
     clean_tt(board)
+    clear_killer()
+    history_white.clear()
+    history_black.clear()
 
     try:
         for depth in range(1, max_depth + 1):
@@ -248,13 +390,7 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
 
             board_copy = board.copy()
 
-            legal_moves = board_copy.legal_moves()
-
-            if best_move is not None and best_move in legal_moves:
-                legal_moves.remove(best_move)
-                legal_moves.insert(0, best_move)
-
-            for n, move in enumerate(legal_moves):
+            for n, move in enumerate(order_moves(board, board.fen(), 0)):
                 board_copy.apply(move)
                 if n == 0:
                     score = -search(board_copy, -INF, INF, depth - 1, 1, True, end)
@@ -272,9 +408,10 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
             best_alpha = alpha
 
             store_tt(board, board.fen(), best_alpha, depth, EXACT, best_move)
+            decay_history()
 
             print(f"Depth: {depth}", end='\r')
-            
+
     except TimeoutError:
         pass
 
