@@ -10,7 +10,7 @@ import nnue
 from time import perf_counter
 from dataclasses import dataclass
 
-from typing import cast, Literal
+from typing import Literal
 from collections.abc import Generator
 
 InputModeOption = Literal["UCI", "SAN"]
@@ -188,15 +188,15 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
     if tt_move is not None:
         yield tt_move
 
-    if b.turn is chess.WHITE:
-        history = history_white
-    else:
-        history = history_black
-
     legal_moves = set(b.legal_moves())
-
     if tt_move is not None:
         legal_moves.remove(tt_move)
+
+    if not legal_moves:
+        return
+    elif len(legal_moves) == 1:
+        yield legal_moves.pop()
+        return
 
     k0 = killer0[ply]
     if k0 in legal_moves and k0 is not None:
@@ -277,6 +277,11 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
 
             legal_moves.difference_update(counters)
 
+        if b.turn is chess.WHITE:
+            history = history_white
+        else:
+            history = history_black
+
         for move in legal_moves:
             history_score = history.get(move)
             if history_score is None:
@@ -292,7 +297,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
     if not captures_only:
         yield from quiets
 
-def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, previous_move: chess.Move, end: float) -> float:
+def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move, end: float) -> float:
     global nodes, counter_moves
     nodes += 1
 
@@ -301,14 +306,14 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             raise TimeoutError
 
     b_fen = b.fen()
-    entry = tt.get(b_fen, None)
+    entry = tt.get(b_fen)
     if entry is not None:
-        if entry.depth >= depth:
+        if entry.depth >= 0:
             score = entry.score
             if score > INF_THRESHHOLD:
-                score = INF - ply
+                score += ply
             elif score < -INF_THRESHHOLD:
-                score = -INF + ply
+                score -= ply
 
             if entry.flag == EXACT:
                 return score
@@ -318,7 +323,81 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
                 alpha = max(alpha, score)
 
             if alpha >= beta:
+                return alpha
+
+    original_alpha = alpha
+
+    stand_pat = nnue.nnue_evaluate_fen(b_fen)
+    if stand_pat > alpha:
+        alpha = stand_pat
+    if alpha >= beta:
+        store_tt(b, b_fen, alpha, 0, LOWER, None)
+        return alpha
+
+    best_score = stand_pat
+    best_move = None
+    for move in order_moves(b, b_fen, ply, previous_move, True):
+        b.apply(move)
+        score = -quiesce(b, -beta, -alpha, ply + 1, move, end)
+        b.undo()
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+        if score > alpha:
+            alpha = score
+
+        if alpha >= beta:
+            break
+
+    if best_score <= original_alpha:
+        flag = UPPER
+    elif best_score >= beta:
+        flag = LOWER
+    else:
+        flag = EXACT
+
+    tt_score = best_score
+    if tt_score > INF_THRESHHOLD:
+        tt_score -= ply
+    elif tt_score < -INF_THRESHHOLD:
+        tt_score += ply
+
+    if entry is not None:
+        if flag == EXACT or entry.depth < 0:
+            store_tt(b, b_fen, tt_score, 0, flag, best_move)
+    else:
+        store_tt(b, b_fen, tt_score, 0, flag, best_move)
+
+    return best_score
+
+def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, previous_move: chess.Move, end: float) -> float:
+    global nodes, counter_moves
+    nodes += 1
+
+    if nodes % 64 == 0:
+        if perf_counter() > end:
+            raise TimeoutError
+
+    b_fen = b.fen()
+    entry = tt.get(b_fen)
+    if entry is not None:
+        if entry.depth >= depth:
+            score = entry.score
+            if score > INF_THRESHHOLD:
+                score += ply
+            elif score < -INF_THRESHHOLD:
+                score -= ply
+
+            if entry.flag == EXACT:
                 return score
+            elif entry.flag == UPPER:
+                beta = min(beta, score)
+            elif entry.flag == LOWER:
+                alpha = max(alpha, score)
+
+            if alpha >= beta:
+                return alpha
 
     if USE_SYZYGY:
         if len(b[None]) >= 59:
@@ -345,7 +424,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
         return -INF + ply
 
     if depth <= 0:
-        return nnue.nnue_evaluate_fen(b.fen())
+        return quiesce(b, alpha, beta, ply, previous_move, end)
 
     original_alpha = alpha
 
@@ -384,9 +463,9 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
     tt_score = best_score
     if tt_score > INF_THRESHHOLD:
-        tt_score = INF - ply
+        tt_score -= ply
     elif tt_score < -INF_THRESHHOLD:
-        tt_score = -INF_THRESHHOLD - ply
+        tt_score += ply
 
     if entry is not None:
         if flag == EXACT or entry.depth < depth:
@@ -397,7 +476,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
     return best_score
 
 def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth: int = MAX_DEPTH) -> tuple[chess.Move, float]:
-    global nodes
+    global nodes, history_white, history_black
     nodes = 0
 
     if USE_OPENING:
