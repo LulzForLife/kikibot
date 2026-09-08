@@ -9,8 +9,9 @@ import nnue
 
 from time import perf_counter
 from dataclasses import dataclass
+from math import log
 
-from typing import Literal
+from typing import Callable, Literal
 from collections.abc import Generator
 
 InputModeOption = Literal["UCI", "SAN"]
@@ -22,7 +23,7 @@ USE_SYZYGY = True
 INPUT_MODE: InputModeOption = "UCI"
 
 TIME_LIMIT = 10.0
-MAX_DEPTH = 10
+MAX_DEPTH = 63
 
 INF = 100000.0
 INF_THRESHHOLD = 97500.0
@@ -60,6 +61,16 @@ MMVLVA = {
     chess.KNIGHT: 300,
     chess.PAWN: 100
 }
+
+ln: Callable[..., float] = lambda n: log(n) if n > 0 else 0.0
+
+LMR: list[list[int]] = [
+    [
+        1 + int((ln(depth) * ln(move_index)) // 2)
+        for move_index in range(218)
+    ]
+    for depth in range(MAX_PLY)
+]
 
 @dataclass(slots=True)
 class TTEntry:
@@ -177,6 +188,25 @@ def decay_history() -> None:
 
     history_white = {move: (score >> 1) for move, score in history_white.items()}
     history_black = {move: (score >> 1) for move, score in history_black.items()}
+
+def syzygy_probe(b: chess.Board, b_fen: str) -> float | None:
+    if len(b[None]) >= 59:
+        c_board = c.Board(b_fen)
+        wdl = tablebase.probe_wdl(c_board)
+        if -1 <= wdl <= 1:
+            score = float(wdl)
+        else:
+            dtz = tablebase.probe_dtz(c_board)
+            if dtz + b.halfmove_clock >= 100:
+                score = float(wdl)
+            elif wdl > 0:
+                score = TABLEBASE_INF - dtz
+            else:
+                score = -TABLEBASE_INF - dtz
+
+        return score
+    else:
+        return None
 
 def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | None, captures_only: bool = False) -> Generator[chess.Move]:
     entry = tt.get(b_fen)
@@ -325,6 +355,17 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
             if alpha >= beta:
                 return alpha
 
+    if USE_SYZYGY:
+        syzygy_score = syzygy_probe(b, b_fen)
+        if syzygy_score is not None:
+            store_tt(b, b_fen, syzygy_score, int(INF), EXACT, None)
+            return syzygy_score
+    
+    if b in chess.DRAW:
+        return 0.0
+    elif b in chess.CHECKMATE:
+        return -INF + ply
+
     original_alpha = alpha
 
     stand_pat = nnue.nnue_evaluate_fen(b_fen)
@@ -400,23 +441,10 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
                 return alpha
 
     if USE_SYZYGY:
-        if len(b[None]) >= 59:
-            c_board = c.Board(b_fen)
-            wdl = tablebase.probe_wdl(c_board)
-            if -1 <= wdl <= 1:
-                score = float(wdl)
-            else:
-                dtz = tablebase.probe_dtz(c_board)
-                if dtz + b.halfmove_clock >= 100:
-                    score = float(wdl)
-                elif wdl > 0:
-                    score = TABLEBASE_INF - dtz
-                else:
-                    score = -TABLEBASE_INF - dtz
-
-            store_tt(b, b_fen, score, int(INF), EXACT, None)
-
-            return score
+        syzygy_score = syzygy_probe(b, b_fen)
+        if syzygy_score is not None:
+            store_tt(b, b_fen, syzygy_score, int(INF), EXACT, None)
+            return syzygy_score
 
     if b in chess.DRAW:
         return 0.0
@@ -431,11 +459,13 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
     best_score = -INF
     best_move = None
     for n, move in enumerate(order_moves(b, b_fen, ply, previous_move)):
+        depth_reduction = LMR[depth][n]
+
         b.apply(move)
         if n == 0:
             score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move, end)
         else:
-            score = -search(b, -alpha - 1, -alpha, depth - 1, ply + 1, False, move, end)
+            score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, move, end)
             if score > alpha:
                 score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move, end)
         b.undo()
