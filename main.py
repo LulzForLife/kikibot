@@ -9,18 +9,21 @@ import nnue
 
 from time import perf_counter
 from dataclasses import dataclass
-from math import log
+from math import log, ceil
 
 from typing import Callable, Literal
 from collections.abc import Generator
 
 InputModeOption = Literal["UCI", "SAN"]
+PrintModeOption = Literal["DEPTH", "UCI", "NONE"]
 
 SELF_PLAY = False
 BOT_STARTS = False
 USE_OPENING = False
 USE_SYZYGY = True
+PONDER = False
 INPUT_MODE: InputModeOption = "UCI"
+PRINT_MODE: PrintModeOption = "DEPTH"
 
 TIME_LIMIT = 10.0
 MAX_DEPTH = 63
@@ -36,8 +39,9 @@ UPPER = 1
 LOWER = 2
 
 nodes = 0
-tt: dict[str, TTEntry] = {}
+END = 0
 
+tt: dict[str, TTEntry] = {}
 killer0: list[chess.Move | None] = [None for _ in range(MAX_PLY)]
 killer1: list[chess.Move | None] = [None for _ in range(MAX_PLY)]
 history_white: dict[chess.Move, int] = {}
@@ -144,6 +148,26 @@ def get_best_opening_move(board: chess.Board) -> chess.Move | None:
         return chess_move
     except IndexError:
         return None
+
+def get_pv(b: chess.Board, move: chess.Move) -> str:
+    b_copy = b.copy()
+    b_copy.apply(move)
+    pv = move.uci()
+
+    while True:
+        b_fen = b_copy.fen()
+        entry = tt.get(b_fen)
+        if entry is None:
+            break
+
+        pv_move = entry.move
+        if pv_move is None:
+            break
+
+        pv += f" {pv_move.uci()}"
+        b_copy.apply(pv_move)
+
+    return pv
 
 def store_tt(b: chess.Board, b_fen: str, score: float, depth: int, flag: int, move: chess.Move | None) -> None:
     global tt
@@ -327,12 +351,12 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
     if not captures_only:
         yield from quiets
 
-def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move, end: float) -> float:
+def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move, ) -> float:
     global nodes, counter_moves
     nodes += 1
 
     if nodes % 64 == 0:
-        if perf_counter() > end:
+        if perf_counter() > END:
             raise TimeoutError
 
     b_fen = b.fen()
@@ -379,7 +403,7 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
     best_move = None
     for move in order_moves(b, b_fen, ply, previous_move, True):
         b.apply(move)
-        score = -quiesce(b, -beta, -alpha, ply + 1, move, end)
+        score = -quiesce(b, -beta, -alpha, ply + 1, move)
         b.undo()
 
         if score > best_score:
@@ -412,13 +436,25 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
 
     return best_score
 
-def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, previous_move: chess.Move, end: float) -> float:
+def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, previous_move: chess.Move) -> float:
     global nodes, counter_moves
     nodes += 1
 
     if nodes % 64 == 0:
-        if perf_counter() > end:
+        if perf_counter() > END:
             raise TimeoutError
+
+    mating_value = INF - ply
+    if mating_value < beta:
+        beta = mating_value
+        if alpha >= beta:
+            return alpha
+
+    mating_value = -INF + ply
+    if mating_value > alpha:
+        alpha = mating_value
+        if alpha >= beta:
+            return alpha
 
     b_fen = b.fen()
     entry = tt.get(b_fen)
@@ -452,7 +488,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
         return -INF + ply
 
     if depth <= 0:
-        return quiesce(b, alpha, beta, ply, previous_move, end)
+        return quiesce(b, alpha, beta, ply, previous_move)
 
     original_alpha = alpha
 
@@ -463,11 +499,11 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
         b.apply(move)
         if n == 0:
-            score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move, end)
+            score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move)
         else:
-            score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, move, end)
+            score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, move)
             if score > alpha:
-                score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move, end)
+                score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move)
         b.undo()
 
         if score > best_score:
@@ -505,9 +541,18 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
     return best_score
 
-def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth: int = MAX_DEPTH) -> tuple[chess.Move, float]:
-    global nodes, history_white, history_black
+def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth: int = MAX_DEPTH, *, print_mode: PrintModeOption | None = None) -> tuple[chess.Move, float]:
+    global nodes, history_white, history_black, END
     nodes = 0
+
+    if time_limit is None:
+        time_limit = TIME_LIMIT
+
+    if max_depth is None:
+        max_depth = MAX_DEPTH
+
+    if print_mode is None:
+        print_mode = PRINT_MODE
 
     if USE_OPENING:
         opening_move = get_best_opening_move(board)
@@ -518,7 +563,11 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
         if len(board[None]) >= 59:
             return get_best_tablebase_move(board)
 
-    end = perf_counter() + time_limit
+    start = perf_counter()
+    if not PONDER:
+        END = start + time_limit
+    else:
+        END = start + 86400
 
     best_move = None
     best_alpha = -INF
@@ -538,11 +587,11 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
             for n, move in enumerate(order_moves(board, board.fen(), 0, None)):
                 board_copy.apply(move)
                 if n == 0:
-                    score = -search(board_copy, -INF, INF, depth - 1, 1, True, move, end)
+                    score = -search(board_copy, -INF, INF, depth - 1, 1, True, move)
                 else:
-                    score = -search(board_copy, -alpha - 1, -alpha, depth - 1, 1, False, move, end)
+                    score = -search(board_copy, -alpha - 1, -alpha, depth - 1, 1, False, move)
                     if score > alpha:
-                        score = -search(board_copy, -INF, -alpha, depth - 1, 1, True, move, end)
+                        score = -search(board_copy, -INF, -alpha, depth - 1, 1, True, move)
                 board_copy.undo()
 
                 if score > alpha:
@@ -555,7 +604,23 @@ def get_best_move(board: chess.Board, time_limit: float = TIME_LIMIT, max_depth:
             store_tt(board, board.fen(), best_alpha, depth, EXACT, best_move)
             decay_history()
 
-            print(f"Depth: {depth}", end='\r')
+            elapsed = perf_counter() - start
+            elapsed_ms = max(1, int(elapsed * 1000))
+            nps = int(nodes / elapsed) if elapsed > 0 else 0
+
+            if print_mode == "DEPTH":
+                print(f"Depth: {depth} (nps {nps})", end='\r')
+            elif print_mode == "UCI":
+                if abs(best_alpha) > INF_THRESHHOLD:
+                    plies_to_mate = INF - abs(best_alpha)
+                    moves_to_mate = ceil(plies_to_mate / 2)
+                    score_str = f"mate {int(moves_to_mate) if best_alpha > 0 else -int(moves_to_mate)}"
+                else:
+                    score_str = f"cp {int(best_alpha)}"
+
+                if best_move is not None:
+                    pv = get_pv(board, best_move)
+                    print(f"info depth {depth} score {score_str} nodes {nodes} nps {nps} time {elapsed_ms} pv {pv}", flush=True)
 
     except TimeoutError:
         pass

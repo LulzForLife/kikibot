@@ -1,0 +1,1 @@
+python -X jit -OO uci.py
