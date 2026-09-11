@@ -22,6 +22,7 @@ BOT_STARTS = False
 USE_OPENING = False
 USE_SYZYGY = True
 PONDER = False
+CLEAN_TT = False
 INPUT_MODE: InputModeOption = "UCI"
 PRINT_MODE: PrintModeOption = "DEPTH"
 
@@ -39,7 +40,7 @@ UPPER = 1
 LOWER = 2
 
 nodes = 0
-END = 0
+END = 0.0
 
 tt: dict[str, TTEntry] = {}
 killer0: list[chess.Move | None] = [None for _ in range(MAX_PLY)]
@@ -351,7 +352,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
     if not captures_only:
         yield from quiets
 
-def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move, ) -> float:
+def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move) -> float:
     global nodes, counter_moves
     nodes += 1
 
@@ -384,7 +385,7 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
         if syzygy_score is not None:
             store_tt(b, b_fen, syzygy_score, int(INF), EXACT, None)
             return syzygy_score
-    
+
     if b in chess.DRAW:
         return 0.0
     elif b in chess.CHECKMATE:
@@ -482,20 +483,73 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             store_tt(b, b_fen, syzygy_score, int(INF), EXACT, None)
             return syzygy_score
 
+    in_check = b in chess.CHECK
+
     if b in chess.DRAW:
         return 0.0
-    elif b in chess.CHECKMATE:
+    elif in_check and b in chess.CHECKMATE:
         return -INF + ply
 
     if depth <= 0:
         return quiesce(b, alpha, beta, ply, previous_move)
+
+    static_eval = None
+    is_pruning = (
+        not in_check and
+        not is_pv and
+        max(abs(beta), abs(alpha)) < TABLEBASE_INF_THRESHHOLD
+    )
+
+    if depth <= 4 and is_pruning:
+        static_eval = nnue.nnue_evaluate_fen(b_fen)
+
+        margin = depth * 80
+
+        if static_eval - margin >= beta:
+            return static_eval - margin
+
+    if depth <= 3 and is_pruning:
+        if static_eval is None:
+            static_eval = nnue.nnue_evaluate_fen(b_fen)
+
+        margin = 200 + (depth * 100)
+
+        if static_eval + margin <= alpha:
+            v = quiesce(b, alpha, alpha + 1, ply, previous_move)
+
+            if v + margin <= alpha:
+                return v
+
+    futility_pruning = False
+    if depth <= 2 and is_pruning:
+        if static_eval is None:
+            static_eval = nnue.nnue_evaluate_fen(b_fen)
+
+        if depth == 1:
+            margin = 150
+        elif depth == 2:
+            margin = 300
+        else:
+            margin = 0
+
+        if static_eval + margin <= alpha:
+            futility_pruning = True
 
     original_alpha = alpha
 
     best_score = -INF
     best_move = None
     for n, move in enumerate(order_moves(b, b_fen, ply, previous_move)):
-        depth_reduction = LMR[depth][n]
+        is_quiet = not (move.is_capture(b) or move.is_promotion())
+
+        if futility_pruning and not (move == killer0[ply] or move == killer1[ply] or n == 0):
+            if is_quiet:
+                continue
+
+        if depth < MAX_PLY:
+            depth_reduction = LMR[depth][n]
+        else:
+            depth_reduction = 0
 
         b.apply(move)
         if n == 0:
@@ -514,7 +568,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             alpha = score
 
         if alpha >= beta:
-            if not (move.is_capture(b) or move.is_promotion()):
+            if is_quiet:
                 store_killer(move, ply)
                 store_history(move, depth, b.turn)
                 counter_moves[previous_move] = move
@@ -572,7 +626,8 @@ def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth
     best_move = None
     best_alpha = -INF
 
-    clean_tt(board)
+    if CLEAN_TT:
+        clean_tt(board)
     clear_killer()
     history_white.clear()
     history_black.clear()

@@ -172,7 +172,12 @@ def parse_go(board: chess.Board, tokens: list[str], is_ponder: bool = False) -> 
 
 def parse_setoption(parts: list[str]) -> None:
     name = parts[1]
-    # do buttons here
+    if name == "Clear_Hash":
+        main.tt.clear()
+        main.clear_killer()
+        main.history_white.clear()
+        main.history_black.clear()
+        main.counter_moves.clear()
     value = parts[3]
     if name == "Opening_Book":
         if not os.path.exists("komodo.bin"):
@@ -200,6 +205,7 @@ def uci_loop() -> None:
     main.PRINT_MODE = "UCI"
     main.USE_OPENING = False
     main.USE_SYZYGY = False
+    main.CLEAN_TT = False
 
     while True:
         line = sys.stdin.readline()
@@ -216,6 +222,7 @@ def uci_loop() -> None:
             print("id author kiranmjlowe")
             print("option name Opening_Book type check default false")
             print("option name Use_Syzygy type check default false")
+            print("option name Clear_Hash type button")
             print("uciok", flush=True)
         elif cmd == "isready":
             print("readyok", flush=True)

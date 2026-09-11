@@ -18,5 +18,5 @@ _nnue.nnue_init(
 _nnue.nnue_evaluate_fen.argtypes = [ctypes.c_char_p]
 _nnue.nnue_evaluate_fen.restype = ctypes.c_int
 
-def nnue_evaluate_fen(fen: str) -> int:
+def nnue_evaluate_fen(fen: str) -> float:
     return _nnue.nnue_evaluate_fen(fen.encode("utf-8"))
