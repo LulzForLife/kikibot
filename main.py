@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bulletchess as chess
+import bulletchess.utils as utils
 import chess as c
 import chess.polyglot as polyglot
 import chess.syzygy as syzygy
@@ -103,41 +104,49 @@ def get_user_move(b: chess.Board) -> chess.Move:
             ...
     return move
 
-def get_best_tablebase_move(b: chess.Board) -> tuple[chess.Move, float]:
+def get_best_syzygy_move(b: chess.Board) -> chess.Move:
 
-    c_board = c.Board(b.fen())
+    b_copy = b.copy()
+    while b_copy.history:
+        b_copy.undo()
+    c_board = c.Board(b_copy.fen())
+    for move in b.history:
+        c_board.push(c.Move.from_uci(move.uci()))
 
-    best_wdl = int(-INF)
-    best_dtz = int(INF)
-    best_move = None
+    target_wdl = -tablebase.probe_wdl(c_board)
+    target_dtz = abs(tablebase.probe_dtz(c_board)) - 1
+    print(f"target_wdl={target_wdl},target_dtz={target_dtz}")
 
     for move in c_board.legal_moves:
-
+        is_zeroing = c_board.is_zeroing(move)
         c_board.push(move)
 
-        wdl = -tablebase.probe_wdl(c_board)
-        dtz = -tablebase.probe_dtz(c_board)
+        outcome = c_board.outcome(claim_draw=True)
+        if outcome is not None:
+            if outcome.winner is None:
+                if abs(target_wdl) != 2:
+                    chess_move = chess.Move.from_uci(move.uci())
+                    assert chess_move
+                    return chess_move
+                c_board.pop()
+                continue
+            chess_move = chess.Move.from_uci(move.uci())
+            assert chess_move
+            return chess_move
 
+        wdl = tablebase.probe_wdl(c_board)
+        dtz = abs(tablebase.probe_dtz(c_board))
         c_board.pop()
 
-        if wdl > best_wdl:
-            best_wdl = wdl
-            best_dtz = dtz
-            best_move = move
-        elif wdl == best_wdl and dtz < best_dtz:
-            best_dtz = dtz
-            best_move = move
+        if wdl == target_wdl and (dtz == target_dtz or (target_dtz == 0 and is_zeroing)):
+            chess_move = chess.Move.from_uci(move.uci())
+            assert chess_move
+            return chess_move
 
-    assert best_move is not None
-    best_chess_move = chess.Move.from_uci(best_move.uci())
-    assert best_chess_move is not None
-
-    if best_wdl == 2:
-        return best_chess_move, TABLEBASE_INF
-    elif best_wdl == -2:
-        return best_chess_move, -TABLEBASE_INF
-    else:
-        return best_chess_move, 0
+    move = utils.random_legal_move(b)
+    if move is None:
+        raise ValueError
+    return move
 
 def get_best_opening_move(board: chess.Board) -> chess.Move | None:
     try:
@@ -352,7 +361,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
     if not captures_only:
         yield from quiets
 
-def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move) -> float:
+def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: chess.Move | None) -> float:
     global nodes, counter_moves
     nodes += 1
 
@@ -437,7 +446,7 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
 
     return best_score
 
-def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, previous_move: chess.Move) -> float:
+def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_pv: bool, is_null: bool, previous_move: chess.Move | None) -> float:
     global nodes, counter_moves
     nodes += 1
 
@@ -449,13 +458,13 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
     if mating_value < beta:
         beta = mating_value
         if alpha >= beta:
-            return alpha
+            return mating_value
 
     mating_value = -INF + ply
     if mating_value > alpha:
         alpha = mating_value
         if alpha >= beta:
-            return alpha
+            return mating_value
 
     b_fen = b.fen()
     entry = tt.get(b_fen)
@@ -520,6 +529,30 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             if v + margin <= alpha:
                 return v
 
+    only_pawns = not (
+        b[(b.turn, chess.QUEEN)] or
+        b[(b.turn, chess.ROOK)] or
+        b[(b.turn, chess.BISHOP)] or
+        b[(b.turn, chess.KNIGHT)]
+    )
+
+    if depth >= 3 and is_pruning and not is_null and not only_pawns:
+        if static_eval is None:
+            static_eval = nnue.nnue_evaluate_fen(b_fen)
+
+        if static_eval >= beta:
+            b.apply(None)
+
+            r = 3 if depth > 6 else 2
+            score = -search(b, -beta, -beta + 1, depth - r, ply + 1, False, True, None)
+
+            b.undo()
+
+            if score >= beta:
+                if score >= TABLEBASE_INF_THRESHHOLD:
+                    return beta
+                return score
+
     futility_pruning = False
     if depth <= 2 and is_pruning:
         if static_eval is None:
@@ -552,12 +585,12 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             depth_reduction = 0
 
         b.apply(move)
-        if n == 0:
-            score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move)
+        if n == 0 or not is_quiet:
+            score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, False, move)
         else:
-            score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, move)
+            score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, False, move)
             if score > alpha:
-                score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, move)
+                score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, False, move)
         b.undo()
 
         if score > best_score:
@@ -571,7 +604,8 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             if is_quiet:
                 store_killer(move, ply)
                 store_history(move, depth, b.turn)
-                counter_moves[previous_move] = move
+                if previous_move is not None:
+                    counter_moves[previous_move] = move
             break
 
     if best_score <= original_alpha:
@@ -595,7 +629,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
     return best_score
 
-def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth: int = MAX_DEPTH, *, print_mode: PrintModeOption | None = None) -> tuple[chess.Move, float]:
+def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth: int | None = None, *, print_mode: PrintModeOption | None = None) -> tuple[chess.Move, float]:
     global nodes, history_white, history_black, END
     nodes = 0
 
@@ -608,20 +642,37 @@ def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth
     if print_mode is None:
         print_mode = PRINT_MODE
 
-    if USE_OPENING:
-        opening_move = get_best_opening_move(board)
-        if opening_move is not None:
-            return opening_move, nnue.nnue_evaluate_fen(board.fen())
-
-    if USE_SYZYGY:
-        if len(board[None]) >= 59:
-            return get_best_tablebase_move(board)
-
     start = perf_counter()
     if not PONDER:
         END = start + time_limit
     else:
         END = start + 86400
+
+    if USE_OPENING:
+        opening_move = get_best_opening_move(board)
+        if opening_move is not None:
+            score = nnue.nnue_evaluate_fen(board.fen())
+            if print_mode == "UCI":
+                elapsed = perf_counter() - start
+                elapsed_ms = max(1, int(elapsed * 1000))
+                print(f"info depth 0 score cp {score} nodes 0 nps 0 time {elapsed_ms} pv {opening_move.uci()}")
+            return opening_move, nnue.nnue_evaluate_fen(board.fen())
+
+    if USE_SYZYGY:
+        if len(board[None]) >= 59:
+            move = get_best_syzygy_move(board)
+            score = 0
+            if print_mode == "UCI":
+                elapsed = perf_counter() - start
+                elapsed_ms = max(1, int(elapsed * 1000))
+                if abs(score) > INF_THRESHHOLD:
+                    plies_to_mate = INF - abs(score)
+                    moves_to_mate = ceil(plies_to_mate / 2)
+                    score_str = f"mate {int(moves_to_mate) if score > 0 else -int(moves_to_mate)}"
+                else:
+                    score_str = f"cp {int(score)}"
+                print(f"info depth 0 score {score_str} nodes 0 nps 0 time {elapsed_ms} pv {move.uci()}")
+            return move, score
 
     best_move = None
     best_alpha = -INF
@@ -642,11 +693,11 @@ def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth
             for n, move in enumerate(order_moves(board, board.fen(), 0, None)):
                 board_copy.apply(move)
                 if n == 0:
-                    score = -search(board_copy, -INF, INF, depth - 1, 1, True, move)
+                    score = -search(board_copy, -INF, INF, depth - 1, 1, True, False, move)
                 else:
-                    score = -search(board_copy, -alpha - 1, -alpha, depth - 1, 1, False, move)
+                    score = -search(board_copy, -alpha - 1, -alpha, depth - 1, 1, False, False, move)
                     if score > alpha:
-                        score = -search(board_copy, -INF, -alpha, depth - 1, 1, True, move)
+                        score = -search(board_copy, -INF, -alpha, depth - 1, 1, True, False, move)
                 board_copy.undo()
 
                 if score > alpha:

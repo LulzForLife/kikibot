@@ -6,6 +6,7 @@ import time
 import threading
 
 TIME_LIMIT = main.TIME_LIMIT
+MOVE_OVERHEAD = 0
 
 class DualOutputStream:
     def __init__(self, log_file, original_stream, prefix=""):
@@ -165,12 +166,13 @@ def parse_go(board: chess.Board, tokens: list[str], is_ponder: bool = False) -> 
     b = board.copy()
     thread = threading.Thread(
         target=run_and_print,
-        args=(b, TIME_LIMIT, max_depth),
+        args=(b, TIME_LIMIT - (MOVE_OVERHEAD / 1000), max_depth),
         daemon=True
     )
     thread.start()
 
 def parse_setoption(parts: list[str]) -> None:
+    global MOVE_OVERHEAD
     name = parts[1]
     if name == "Clear_Hash":
         main.tt.clear()
@@ -178,6 +180,7 @@ def parse_setoption(parts: list[str]) -> None:
         main.history_white.clear()
         main.history_black.clear()
         main.counter_moves.clear()
+        return
     value = parts[3]
     if name == "Opening_Book":
         if not os.path.exists("komodo.bin"):
@@ -197,6 +200,9 @@ def parse_setoption(parts: list[str]) -> None:
         elif value == "false":
             main.USE_SYZYGY = False
             print("info string Disabled syzygy", flush=True)
+    elif name == "Move_Overhead_MS":
+        ms = int(value)
+        MOVE_OVERHEAD = ms
 
 def uci_loop() -> None:
     sys.stdout.reconfigure(line_buffering=True) # type: ignore
@@ -223,6 +229,7 @@ def uci_loop() -> None:
             print("option name Opening_Book type check default false")
             print("option name Use_Syzygy type check default false")
             print("option name Clear_Hash type button")
+            print("option name Move_Overhead_MS type spin default 0 min 0 max 1000")
             print("uciok", flush=True)
         elif cmd == "isready":
             print("readyok", flush=True)
