@@ -72,7 +72,7 @@ ln: Callable[..., float] = lambda n: log(n) if n > 0 else 0.0
 
 LMR: list[list[int]] = [
     [
-        1 + int((ln(depth) * ln(move_index)) // 2)
+        int((ln(depth) * ln(move_index)) // 2)
         for move_index in range(218)
     ]
     for depth in range(MAX_PLY)
@@ -216,6 +216,8 @@ def store_history(move: chess.Move, depth: int, turn: chess.Color) -> None:
 
     if turn is chess.WHITE:
         history_white[move] = history_white.get(move, 0) + (depth * depth)
+    else:
+        history_black[move] = history_black.get(move, 0) + (depth * depth)
 
 def decay_history() -> None:
     global history_white, history_black
@@ -319,7 +321,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
             else:
                 losing[move] = score
 
-    for move, value in sorted(winning.items(), key=lambda t: t[1]):
+    for move, value in sorted(winning.items(), key=lambda t: t[1], reverse=True):
         yield move
     yield from equal
 
@@ -329,7 +331,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
         if k1 is not None:
             yield k1
 
-    legal_moves.difference_update(winning.keys(), equal)
+    legal_moves.difference_update(winning.keys(), equal, losing.keys())
 
     if not captures_only:
         if prev_move is not None:
@@ -353,7 +355,7 @@ def order_moves(b: chess.Board, b_fen: str, ply: int, prev_move: chess.Move | No
             else:
                 histories[move] = history_score
 
-        for move, value in sorted(histories.items(), key=lambda t: t[1]):
+        for move, value in sorted(histories.items(), key=lambda t: t[1], reverse=True):
             yield move
 
     yield from losing
@@ -403,11 +405,16 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int, previous_move: 
     original_alpha = alpha
 
     stand_pat = nnue.nnue_evaluate_fen(b_fen)
+
     if stand_pat > alpha:
         alpha = stand_pat
+
     if alpha >= beta:
         store_tt(b, b_fen, alpha, 0, LOWER, None)
         return alpha
+
+    if stand_pat + 1000 < alpha:
+        return stand_pat + 1000
 
     best_score = stand_pat
     best_move = None
@@ -570,7 +577,10 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
 
     original_alpha = alpha
 
-    best_score = -INF
+    if futility_pruning:
+        best_score = static_eval
+    else:
+        best_score = -INF
     best_move = None
     for n, move in enumerate(order_moves(b, b_fen, ply, previous_move)):
         is_quiet = not (move.is_capture(b) or move.is_promotion())
@@ -585,7 +595,7 @@ def search(b: chess.Board, alpha: float, beta: float, depth: int, ply: int, is_p
             depth_reduction = 0
 
         b.apply(move)
-        if n == 0 or not is_quiet:
+        if n == 0:
             score = -search(b, -beta, -alpha, depth - 1, ply + 1, True, False, move)
         else:
             score = -search(b, -alpha - 1, -alpha, depth - 1 - depth_reduction, ply + 1, False, False, move)
@@ -730,6 +740,9 @@ def get_best_move(board: chess.Board, time_limit: float | None = None, max_depth
 
     except TimeoutError:
         pass
+
+    if best_move is None:
+        best_move = utils.random_legal_move(board)
 
     assert best_move
 
